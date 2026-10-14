@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Radar</title>
+<style>
+  :root { --bg:#02090a; --grid:#1f7a3a; --glow:#62f51f; --dim:#2d9c52; --hit:#ff3b30; --text:#8dffb0; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: ui-monospace, "SF Mono", Menlo, monospace;
+         display:flex; flex-direction:column; height:100vh; }
+  header { display:flex; flex-wrap:wrap; gap:12px 20px; align-items:center; padding:12px 16px; border-bottom:1px solid #123d1c; }
+  header label { display:flex; align-items:center; gap:6px; font-size:14px; }
+  input, select, button { font:inherit; background:#06150a; color:var(--text); border:1px solid var(--grid); border-radius:4px; padding:6px 10px; }
+  input { width:84px; }
+  button { cursor:pointer; }
+  button:hover { background:#0c2a14; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline:2px solid var(--glow); outline-offset:2px; }
+  #status { margin-left:auto; font-size:14px; color:var(--dim); }
+  main { flex:1; min-height:0; position:relative; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
+  footer { display:flex; gap:32px; padding:12px 16px; font-size:22px; border-top:1px solid #123d1c; }
+  footer span { color:var(--glow); }
+</style>
+</head>
+<body>
+<header>
+  <button id="connect">Connect to ESP32</button>
+  <button id="demo">Run demo</button>
+  <label>Baud <input id="baud" type="number" value="115200"></label>
+  <label>Range (cm) <input id="range" type="number" value="100" min="10"></label>
+  <span id="status">Not connected</span>
+</header>
+<main><canvas id="c"></canvas></main>
+<footer>
+  <div>Angle: <span id="angle">--</span>&deg;</div>
+  <div>Distance: <span id="dist">--</span></div>
+  <div id="state">No data</div>
+</footer>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const $ = id => document.getElementById(id);
+
+let maxRange = +$('range').value;          // cm
+let angle = 0, distCm = 0, lastSweepAngle = 0;
+const blips = [];                           // {a, d, t} recent detections
+const BLIP_LIFE = 4000;                     // ms a detection stays visible
+let lastData = 0, demoTimer = null, port = null, reader = null;
+
+$('range').addEventListener('input', e => { maxRange = Math.max(10, +e.target.value || 100); });
+
+/* ---------- data handling ---------- */
+function handleReading(a, dMm) {
+  angle = a;
+  const d = dMm / 10;                       // mm -> cm
+  distCm = d;
+  lastData = performance.now();
+  if (d > 0 && d < maxRange) blips.push({ a, d, t: lastData });
+  $('angle').textContent = a;
+  const inRange = d > 0 && d < maxRange;
+  $('dist').textContent = inRange ? d.toFixed(1) + ' cm' : '--';
+  $('state').textContent = inRange ? 'In range' : 'Out of range';
+}
+
+let buffer = '';
+function feed(text) {
+  buffer += text;
+  let i;
+  while ((i = buffer.indexOf('.')) >= 0) {   // '.' ends each "angle,distance" message
+    const msg = buffer.slice(0, i).trim();
+    buffer = buffer.slice(i + 1);
+    const m = msg.match(/^(\d{1,3}),(-?\d+)$/);   // ignore boot messages and garbage
+    if (m) handleReading(+m[1], +m[2]);
+  }
+  if (buffer.length > 200) buffer = '';      // safety: drop runaway garbage
+}
+
+/* ---------- Web Serial ---------- */
+async function connect() {
+  if (!('serial' in navigator)) {
+    $('status').textContent = 'Web Serial needs Chrome or Edge';
+    return;
+  }
+  try {
+    stopDemo();
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: +$('baud').value });
+    $('status').textContent = 'Connected';
+    $('connect').textContent = 'Disconnect';
+    const decoder = new TextDecoderStream();
+    port.readable.pipeTo(decoder.writable).catch(() => {});
+    reader = decoder.readable.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) feed(value);
+    }
+  } catch (err) {
+    $('status').textContent = 'Error: ' + err.message;
+  }
+  await disconnect();
+}
+
+async function disconnect() {
+  try { if (reader) await reader.cancel(); } catch {}
+  try { if (port) await port.close(); } catch {}
+  reader = null; port = null;
+  $('connect').textContent = 'Connect to ESP32';
+  if (!demoTimer) $('status').textContent = 'Not connected';
+}
+
+$('connect').addEventListener('click', () => { port ? disconnect() : connect(); });
+
+/* ---------- demo mode (no hardware needed) ---------- */
+function startDemo() {
+  if (port) return;
+  let a = 0, dir = 1;
+  $('status').textContent = 'Demo running';
+  $('demo').textContent = 'Stop demo';
+  demoTimer = setInterval(() => {
+    a += dir; if (a >= 180 || a <= 0) dir = -dir;
+    // two fake objects so you can see how blips look
+    let d = 9999;
+    if (Math.abs(a - 40) < 8) d = 350 + Math.abs(a - 40) * 8;
+    if (Math.abs(a - 125) < 12) d = 700 + Math.abs(a - 125) * 10;
+    handleReading(a, d);
+  }, 15);
+}
+function stopDemo() {
+  clearInterval(demoTimer); demoTimer = null;
+  $('demo').textContent = 'Run demo';
+  if (!port) $('status').textContent = 'Not connected';
+}
+$('demo').addEventListener('click', () => demoTimer ? stopDemo() : startDemo());
+
+/* ---------- drawing ---------- */
+function resize() {
+  const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  canvas.width = r.width * dpr; canvas.height = r.height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+function draw(now) {
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  const cx = W / 2, cy = H - 36;
+  const R = Math.min(W / 2 - 24, cy - 16);
+  const px = cm => (cm / maxRange) * R;
+  const pt = (a, r) => [cx + r * Math.cos(a * Math.PI / 180), cy - r * Math.sin(a * Math.PI / 180)];
+
+  ctx.clearRect(0, 0, W, H);
+
+  // range rings + labels
+  ctx.lineWidth = 1.5; ctx.strokeStyle = '#1f7a3a'; ctx.fillStyle = '#2d9c52';
+  ctx.font = '13px ui-monospace, Menlo, monospace'; ctx.textAlign = 'center';
+  for (let i = 1; i <= 4; i++) {
+    const r = R * i / 4;
+    ctx.beginPath(); ctx.arc(cx, cy, r, Math.PI, 2 * Math.PI); ctx.stroke();
+    ctx.fillText(Math.round(maxRange * i / 4) + ' cm', cx + r - 22, cy + 18);
+  }
+
+  // angle spokes + labels
+  for (let a = 0; a <= 180; a += 30) {
+    const [x, y] = pt(a, R);
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y); ctx.stroke();
+    const [lx, ly] = pt(a, R + 14);
+    ctx.fillText(a + '\u00b0', lx, ly + 4);
+  }
+
+  // fading sweep trail behind the beam
+  const dirSign = Math.sign(angle - lastSweepAngle) || 1;
+  for (let k = 0; k < 18; k++) {
+    const a = angle - dirSign * k * 1.2;
+    const [x, y] = pt(a, R);
+    ctx.strokeStyle = `rgba(98,245,31,${0.28 * (1 - k / 18)})`;
+    ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y); ctx.stroke();
+  }
+  lastSweepAngle = angle;
+
+  // main beam
+  const [bx, by] = pt(angle, R);
+  ctx.strokeStyle = '#62f51f'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(bx, by); ctx.stroke();
+
+  // detections: red marks that fade out
+  while (blips.length && now - blips[0].t > BLIP_LIFE) blips.shift();
+  ctx.lineWidth = 6; ctx.lineCap = 'round';
+  for (const b of blips) {
+    const alpha = 1 - (now - b.t) / BLIP_LIFE;
+    const [x1, y1] = pt(b.a, px(b.d));
+    const [x2, y2] = pt(b.a, R);
+    ctx.strokeStyle = `rgba(255,59,48,${alpha})`;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+  ctx.lineCap = 'butt';
+
+  // stale-data notice
+  if (lastData && now - lastData > 2000) $('state').textContent = 'No data';
+
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
